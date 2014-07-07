@@ -39,7 +39,7 @@ static unsigned int sizes[LARGEST_ID];
 
 static int crawler_count = 0;
 static volatile int do_run_lru_crawler_thread = 0;
-static int lru_crawler_initialized = 0;
+static int lru_crawler_initialized = 0;//LRU 爬虫，嗯，扫描器
 static pthread_mutex_t lru_crawler_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  lru_crawler_cond = PTHREAD_COND_INITIALIZER;
 
@@ -923,14 +923,14 @@ enum crawler_result_type lru_crawler_crawl(char *slabs) {
     return CRAWLER_OK;
 }
 
-int init_lru_crawler(void) {
+int init_lru_crawler(void) {//初始化LRU扫描的锁
     if (lru_crawler_initialized == 0) {
         if (pthread_cond_init(&lru_crawler_cond, NULL) != 0) {
             fprintf(stderr, "Can't initialize lru crawler condition\n");
             return -1;
         }
         pthread_mutex_init(&lru_crawler_lock, NULL);
-        lru_crawler_initialized = 1;
+        lru_crawler_initialized = 1;//
     }
     return 0;
 }

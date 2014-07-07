@@ -408,7 +408,7 @@ struct conn {
     enum conn_states  state;
     enum bin_substates substate;
     rel_time_t last_cmd_time;
-    struct event event;
+    struct event event;//libevent事件结构
     short  ev_flags;
     short  which;   /** which events were just triggered */
 
@@ -462,12 +462,12 @@ struct conn {
     char   **suffixcurr;
     int    suffixleft;
 
-    enum protocol protocol;   /* which protocol this connection speaks */
+    enum protocol protocol;   /* which protocol this connection speaks *///通讯协议，二进制还是ASSIi
     enum network_transport transport; /* what transport is used by this connection */
 
     /* data for UDP clients */
     int    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
-    struct sockaddr_in6 request_addr; /* udp: Who sent the most recent request */
+    struct sockaddr_in6 request_addr; /* udp: Who sent the most recent request *///客户端tcp地址
     socklen_t request_addr_size;
     unsigned char *hdrbuf; /* udp packet headers */
     int    hdrsize;   /* number of headers' worth of space is allocated */
@@ -482,12 +482,13 @@ struct conn {
 
     /* Binary protocol stuff */
     /* This is where the binary header goes */
-    protocol_binary_request_header binary_header;
+    protocol_binary_request_header binary_header;//二进制协议头的数据，解析出来的
     uint64_t cas; /* the cas to return */
     short cmd; /* current command being processed */
     int opaque;
     int keylen;
     conn   *next;     /* Used for generating a list of conn structures */
+	//所属于的线程
     LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
 };
 

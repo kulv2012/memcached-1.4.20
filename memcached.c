@@ -110,7 +110,7 @@ struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
 
 /** file scope variables **/
-static conn *listen_conn = NULL;
+static conn *listen_conn = NULL;//所有的TCP listen连接链表
 static int max_fds;
 static struct event_base *main_base;
 
@@ -131,6 +131,7 @@ static enum transmit_result transmit(conn *c);
 static volatile bool allow_new_conns = true;
 static struct event maxconnsevent;
 static void maxconns_handler(const int fd, const short which, void *arg) {
+	//设置一个10ms的定时器，为了让系统能从accept返回EMFILE的错误中恢复过来
     struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
 
     if (fd == -42 || allow_new_conns == false) {
@@ -247,7 +248,7 @@ static void settings_init(void) {
  * Returns 0 on success, -1 on out-of-memory.
  */
 static int add_msghdr(conn *c)
-{
+{//UDP的数据结构
     struct msghdr *msg;
 
     assert(c != NULL);
@@ -305,7 +306,7 @@ static void conn_init(void) {
     int next_fd = dup(1);
     int headroom = 10;      /* account for extra unexpected open FDs */
     struct rlimit rl;
-
+	//巧妙的获取最大可能的fd
     max_fds = settings.maxconns + headroom + next_fd;
 
     /* But if possible, get the actual highest FD we can possibly ever see. */
@@ -317,7 +318,7 @@ static void conn_init(void) {
     }
 
     close(next_fd);
-
+	//一次将全部FD都申请好，这样方便查找的时候，直接用FD来索引，快很多的
     if ((conns = calloc(max_fds, sizeof(conn *))) == NULL) {
         fprintf(stderr, "Failed to allocate connection structures\n");
         /* This is unrecoverable so bail out early. */
@@ -345,12 +346,13 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
                 struct event_base *base) {
+	//thread_libevent_process等调用这里，设置一个连接的客户端结构，然后将其加入到event里面，执行函数统一为event_handler
     conn *c;
 
     assert(sfd >= 0 && sfd < max_fds);
-    c = conns[sfd];
+    c = conns[sfd];//直接用fd进行数组索引
 
-    if (NULL == c) {
+    if (NULL == c) {//之前没有使用过，就得创建内容
         if (!(c = (conn *)calloc(1, sizeof(conn)))) {
             STATS_LOCK();
             stats.malloc_fails++;
@@ -400,8 +402,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         conns[sfd] = c;
     }
 
-    c->transport = transport;
-    c->protocol = settings.binding_protocol;
+    c->transport = transport;//协议是哪种
+    c->protocol = settings.binding_protocol;//除非用-B指定，否则这里是默认的negotiating_prot
 
     /* unix socket mode doesn't need this, so zeroed out.  but why
      * is this done for every command?  presumably for UDP
@@ -411,7 +413,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     } else {
         c->request_addr_size = 0;
     }
-
+	//是TCP并且这里是新建了一个客户端连接，那得到其地址结构
     if (transport == tcp_transport && init_state == conn_new_cmd) {
         if (getpeername(sfd, (struct sockaddr *) &c->request_addr,
                         &c->request_addr_size)) {
@@ -462,11 +464,13 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     c->noreply = false;
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
+	//加入到事件循环里面。,不管是LISTEN SOCK，还是客户端的SOCK，都是这个执行函数。只有工作线程的管道不是这个
+	//工作线程的管道执行函数是thread_libevent_process，也就是本函数的调用者之一
+    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);//用参数，填充&c->event
+    event_base_set(base, &c->event);//ev->ev_base = base， 就让event记住了所属的base
+    c->ev_flags = event_flags;//其实 c->event->ev_events也记录了这个事件集合的。
 
-    if (event_add(&c->event, 0) == -1) {
+    if (event_add(&c->event, 0) == -1) {//加到epoll里面去
         perror("event_add");
         return NULL;
     }
@@ -3415,11 +3419,12 @@ static void process_command(conn *c, char *command) {
     c->msgcurr = 0;
     c->msgused = 0;
     c->iovused = 0;
-    if (add_msghdr(c) != 0) {
+    if (add_msghdr(c) != 0) {//准备UDP的数据结构 
         out_of_memory(c, "SERVER_ERROR out of memory preparing response");
         return;
     }
 
+	//将客户端的指令用空格分开，根据参数个数等进行处理
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
     if (ntokens >= 3 &&
         ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
@@ -3659,7 +3664,7 @@ static int try_read_command(conn *c) {
 
     if (c->protocol == binary_prot) {
         /* Do we have the complete packet header? */
-        if (c->rbytes < sizeof(c->binary_header)) {
+        if (c->rbytes < sizeof(c->binary_header)) {//二进制协议有个协议头
             /* need more data! */
             return 0;
         } else {
@@ -3723,7 +3728,7 @@ static int try_read_command(conn *c) {
             c->rbytes -= sizeof(c->binary_header);
             c->rcurr += sizeof(c->binary_header);
         }
-    } else {
+    } else {//二进制协议，空格和回车切分
         char *el, *cont;
 
         if (c->rbytes == 0)
@@ -3753,17 +3758,17 @@ static int try_read_command(conn *c) {
         }
         cont = el + 1;
         if ((el - c->rcurr) > 1 && *(el - 1) == '\r') {
-            el--;
+            el--;//去掉后面的\r, 可能结尾是\r\n
         }
-        *el = '\0';
+        *el = '\0';//结尾符
 
         assert(cont <= (c->rcurr + c->rbytes));
 
-        c->last_cmd_time = current_time;
+        c->last_cmd_time = current_time;//主动更新的时间戳
         process_command(c, c->rcurr);
 
         c->rbytes -= (cont - c->rcurr);
-        c->rcurr = cont;
+        c->rcurr = cont;//从后面的那条命令继续解析
 
         assert(c->rcurr <= (c->rbuf + c->rsize));
     }
@@ -3822,23 +3827,24 @@ static enum try_read_result try_read_udp(conn *c) {
  * @return enum try_read_result
  */
 static enum try_read_result try_read_network(conn *c) {
+	//老办法， 异步读取数据，知道读满或者没东西了
     enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
     int res;
     int num_allocs = 0;
     assert(c != NULL);
 
-    if (c->rcurr != c->rbuf) {
+    if (c->rcurr != c->rbuf) {//为了处理方便，将后面的未处理的数据拷贝到前面
         if (c->rbytes != 0) /* otherwise there's nothing to copy */
             memmove(c->rbuf, c->rcurr, c->rbytes);
         c->rcurr = c->rbuf;
     }
 
     while (1) {
-        if (c->rbytes >= c->rsize) {
+        if (c->rbytes >= c->rsize) {//没空间了，realloc一个
             if (num_allocs == 4) {
                 return gotdata;
             }
-            ++num_allocs;
+            ++num_allocs;//每次翻倍接收缓冲区
             char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
             if (!new_rbuf) {
                 STATS_LOCK();
@@ -3849,31 +3855,31 @@ static enum try_read_result try_read_network(conn *c) {
                 }
                 c->rbytes = 0; /* ignore what we read */
                 out_of_memory(c, "SERVER_ERROR out of memory reading request");
-                c->write_and_go = conn_closing;
+                c->write_and_go = conn_closing;//关闭连接，在上层的时候下一次while会干掉的
                 return READ_MEMORY_ERROR;
             }
-            c->rcurr = c->rbuf = new_rbuf;
+            c->rcurr = c->rbuf = new_rbuf;//rcurr因为上面的保证，总是指向最开头
             c->rsize *= 2;
         }
 
-        int avail = c->rsize - c->rbytes;
+        int avail = c->rsize - c->rbytes;//剩余的空间
         res = read(c->sfd, c->rbuf + c->rbytes, avail);
         if (res > 0) {
-            pthread_mutex_lock(&c->thread->stats.mutex);
+            pthread_mutex_lock(&c->thread->stats.mutex);//靠，大量的锁啊
             c->thread->stats.bytes_read += res;
             pthread_mutex_unlock(&c->thread->stats.mutex);
             gotdata = READ_DATA_RECEIVED;
             c->rbytes += res;
-            if (res == avail) {
+            if (res == avail) {//满了，while一下去realloc
                 continue;
-            } else {
+            } else {//没给我那么多，应该是没有了
                 break;
             }
         }
-        if (res == 0) {
+        if (res == 0) {//返回0为连接断开了
             return READ_ERROR;
         }
-        if (res == -1) {
+        if (res == -1) {//出错了，可能是没东西了
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             }
@@ -3887,7 +3893,7 @@ static bool update_event(conn *c, const int new_flags) {
     assert(c != NULL);
 
     struct event_base *base = c->event.ev_base;
-    if (c->ev_flags == new_flags)
+    if (c->ev_flags == new_flags)//避免重复无用的操作
         return true;
     if (event_del(&c->event) == -1) return false;
     event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
@@ -3910,7 +3916,8 @@ void do_accept_new_conns(const bool do_accept) {
                 perror("listen");
             }
         }
-        else {
+        else {//如果遇到accept的时候，返回EMFILE事件，就在这里将事件清楚掉，并且设置listen的backlog为0，从而拒绝后续的连接。
+			//为了一段时间后能自动恢复，后面设置了maxconns_handler
             update_event(next, 0);
             if (listen(next->sfd, 0) != 0) {
                 perror("listen");
@@ -3928,7 +3935,7 @@ void do_accept_new_conns(const bool do_accept) {
         stats.listen_disabled_num++;
         STATS_UNLOCK();
         allow_new_conns = false;
-        maxconns_handler(-42, 0, 0);
+        maxconns_handler(-42, 0, 0);//设置定时器，让系统能自动恢复过来,设置一个10ms的定时器
     }
 }
 
@@ -4017,12 +4024,12 @@ static void drive_machine(conn *c) {
 
     while (!stop) {
 
-        switch(c->state) {
-        case conn_listening:
+        switch(c->state) {//根据这个SOCK的状态进行处理,
+        case conn_listening://对于监听SOCK， 在server_socket里面设置为conn_listening状态了的
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
             if (use_accept4) {
-                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);//快速设置SOCK_NONBLOCK状态
             } else {
                 sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
             }
@@ -4041,7 +4048,7 @@ static void drive_machine(conn *c) {
                 } else if (errno == EMFILE) {
                     if (settings.verbose > 0)
                         fprintf(stderr, "Too many open connections\n");
-                    accept_new_conns(false);
+                    accept_new_conns(false);//由于句柄太多，所以这里将监听句柄设置为不监听状态.http://chenzhenianqing.cn/articles/1044.html
                     stop = true;
                 } else {
                     perror("accept()");
@@ -4049,7 +4056,7 @@ static void drive_machine(conn *c) {
                 }
                 break;
             }
-            if (!use_accept4) {
+            if (!use_accept4) {//如果没有用accept4函数，还需要手动设置为非阻塞模式
                 if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
                     perror("setting O_NONBLOCK");
                     close(sfd);
@@ -4060,12 +4067,12 @@ static void drive_machine(conn *c) {
             if (settings.maxconns_fast &&
                 stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1) {
                 str = "ERROR Too many open connections\r\n";
-                res = write(sfd, str, strlen(str));
+                res = write(sfd, str, strlen(str));//直接给对方发送错误码，然后关闭连接
                 close(sfd);
                 STATS_LOCK();
                 stats.rejected_conns++;
                 STATS_UNLOCK();
-            } else {
+            } else {//OK，将这个连接分配给线程去处理吧
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
                                      DATA_BUFFER_SIZE, tcp_transport);
             }
@@ -4086,14 +4093,15 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_read:
+			//异步读取数据，返回是否出错
             res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
 
             switch (res) {
             case READ_NO_DATA_RECEIVED:
-                conn_set_state(c, conn_waiting);
+                conn_set_state(c, conn_waiting);//
                 break;
             case READ_DATA_RECEIVED:
-                conn_set_state(c, conn_parse_cmd);
+                conn_set_state(c, conn_parse_cmd);//下一步要去解析这条命令了
                 break;
             case READ_ERROR:
                 conn_set_state(c, conn_closing);
@@ -4116,7 +4124,7 @@ static void drive_machine(conn *c) {
             /* Only process nreqs at a time to avoid starving other
                connections */
 
-            --nreqs;
+            --nreqs;//
             if (nreqs >= 0) {
                 reset_cmd_handler(c);
             } else {
@@ -4340,7 +4348,7 @@ void event_handler(const int fd, const short which, void *arg) {
     c = (conn *)arg;
     assert(c != NULL);
 
-    c->which = which;
+    c->which = which;//具体哪个事件被触发了 
 
     /* sanity */
     if (fd != c->sfd) {
@@ -4356,7 +4364,7 @@ void event_handler(const int fd, const short which, void *arg) {
     return;
 }
 
-static int new_socket(struct addrinfo *ai) {
+static int new_socket(struct addrinfo *ai) {//创建socket， 设置非阻塞模式
     int sfd;
     int flags;
 
@@ -4364,6 +4372,7 @@ static int new_socket(struct addrinfo *ai) {
         return -1;
     }
 
+	//立即设置为非阻塞模式
     if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 ||
         fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0) {
         perror("setting O_NONBLOCK");
@@ -4421,6 +4430,7 @@ static int server_socket(const char *interface,
                          int port,
                          enum network_transport transport,
                          FILE *portnumber_file) {
+	//创建socket，然后根据其是TCP还是UDP，设置相关的结构，到目前为止就可以监听了
     int sfd;
     struct linger ling = {0, 0};
     struct addrinfo *ai;
@@ -4447,9 +4457,9 @@ static int server_socket(const char *interface,
         return 1;
     }
 
-    for (next= ai; next; next= next->ai_next) {
+    for (next= ai; next; next= next->ai_next) {//getaddrinfo可能会返回多个地址，所以这里需要循环
         conn *listen_conn_add;
-        if ((sfd = new_socket(next)) == -1) {
+        if ((sfd = new_socket(next)) == -1) {//创建socket， 设置非阻塞模式
             /* getaddrinfo can return "junk" addresses,
              * we make sure at least one works before erroring.
              */
@@ -4472,18 +4482,20 @@ static int server_socket(const char *interface,
         }
 #endif
 
+		//SO_REUSEADDR, 快速重启
         setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
         if (IS_UDP(transport)) {
             maximize_sndbuf(sfd);
         } else {
             error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-            if (error != 0)
+            if (error != 0)//打开KEEPALIVE，默认2个小时7200的时间断开连接
                 perror("setsockopt");
-
+			
+			//不安比延迟关闭算法
             error = setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
-            if (error != 0)
+            if (error != 0)//关闭LINGER算法,主动设置为默认模式：当close(fd)时，系统接管套接字并保证将数据发送至对端。
                 perror("setsockopt");
-
+			//关闭nagle算法，有数据立即发送不等待更多一起发送
             error = setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
             if (error != 0)
                 perror("setsockopt");
@@ -4499,13 +4511,14 @@ static int server_socket(const char *interface,
             close(sfd);
             continue;
         } else {
-            success++;
+            success++;//变为listen socket
             if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
                 perror("listen()");
                 close(sfd);
                 freeaddrinfo(ai);
                 return 1;
             }
+			//下面看看是不是要将socket数据写入到文件中，没啥必要
             if (portnumber_file != NULL &&
                 (next->ai_addr->sa_family == AF_INET ||
                  next->ai_addr->sa_family == AF_INET6)) {
@@ -4528,10 +4541,11 @@ static int server_socket(const char *interface,
             }
         }
 
-        if (IS_UDP(transport)) {
+        if (IS_UDP(transport)) {//如果是UDP协议，那么直接将这个监听端口分破给num_threads_per_udp个线程，让他们一起处理
+			//因为是数据报文，接收的时候是一个报文一个报文接收，所以随便某个线程接收了都行，不需要accept。
             int c;
 
-            for (c = 0; c < settings.num_threads_per_udp; c++) {
+            for (c = 0; c < settings.num_threads_per_udp; c++) {//一个udp端口提供给几个线程公用
                 /* Allocate one UDP file descriptor per worker thread;
                  * this allows "stats conns" to separately list multiple
                  * parallel UDP requests in progress.
@@ -4540,12 +4554,13 @@ static int server_socket(const char *interface,
                  * among threads, so this is guaranteed to assign one
                  * FD to each thread.
                  */
-                int per_thread_fd = c ? dup(sfd) : sfd;
+                int per_thread_fd = c ? dup(sfd) : sfd;//将后面的全部dup一份，这样大家都可以独立对待了，比如关闭什么的
                 dispatch_conn_new(per_thread_fd, conn_read,
                                   EV_READ | EV_PERSIST,
                                   UDP_READ_BUFFER_SIZE, transport);
             }
-        } else {
+        } else {//tcp模式
+			//将这个TCP连接放到main_base事件循环中，设置为EV_PERSIST模式,回调为：event_handler
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
                                              EV_READ | EV_PERSIST, 1,
                                              transport, main_base))) {
@@ -4553,7 +4568,7 @@ static int server_socket(const char *interface,
                 exit(EXIT_FAILURE);
             }
             listen_conn_add->next = listen_conn;
-            listen_conn = listen_conn_add;
+            listen_conn = listen_conn_add;//挂载到链表头部
         }
     }
 
@@ -4566,7 +4581,7 @@ static int server_socket(const char *interface,
 static int server_sockets(int port, enum network_transport transport,
                           FILE *portnumber_file) {
     if (settings.inter == NULL) {
-        return server_socket(settings.inter, port, transport, portnumber_file);
+        return server_socket(settings.inter, port, transport, portnumber_file);//创建socket结构,设置为监听模式等。目前还么有加入libevent
     } else {
         // tokenize them and bind to each one of them..
         char *b;
@@ -4686,7 +4701,7 @@ static int server_socket_unix(const char *path, int access_mask) {
  * rather than absolute UNIX timestamps, a space savings on systems where
  * sizeof(time_t) > sizeof(unsigned int).
  */
-volatile rel_time_t current_time;
+volatile rel_time_t current_time;//主动更新的时间戳
 static struct event clockevent;
 
 /* libevent uses a monotonic clock when available for event scheduling. Aside
@@ -4719,7 +4734,7 @@ static void clock_handler(const int fd, const short which, void *arg) {
 
     evtimer_set(&clockevent, clock_handler, 0);
     event_base_set(main_base, &clockevent);
-    evtimer_add(&clockevent, &t);
+    evtimer_add(&clockevent, &t);//每秒触发
 
 #if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
     if (monotonic) {
@@ -5524,21 +5539,25 @@ int main (int argc, char **argv) {
     /* initialize other stuff */
     stats_init();
     assoc_init(settings.hashpower_init);
-    conn_init();
+    conn_init();//默认分配200个连接结构
     slabs_init(settings.maxbytes, settings.factor, preallocate);
 
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
      * need that information
      */
+	//当服务器close一个连接时，若client端接着发数据。根据TCP协议的规定，会收到一个RST响应，
+	//client再往这个服务器发送数据时，系统会发出一个SIGPIPE信号给进程，告诉进程这个连接已经断开了，不要再写了。
     if (sigignore(SIGPIPE) == -1) {
         perror("failed to ignore SIGPIPE; sigaction");
         exit(EX_OSERR);
     }
     /* start up worker threads if MT mode */
-    thread_init(settings.num_threads, main_base);
+    thread_init(settings.num_threads, main_base);//默认4个线程,启动其libevet结构。设置监听管道，管道用来让主线程告诉自己，有新事件了
+	//上面工作线程已经准备好了，下面主线程终于可以设置自己的东西了，比如打开LISTEN socket，进行accepted监听。
+	//memcached的模式为：主线程负责accept，完了管道告诉工作线程去处理实际的请求。2着不同的event_base
 
-    if (start_assoc_maintenance_thread() == -1) {
+    if (start_assoc_maintenance_thread() == -1) {//启动维护线程
         exit(EXIT_FAILURE);
     }
 
@@ -5548,7 +5567,7 @@ int main (int argc, char **argv) {
     }
 
     /* Run regardless of initializing it later */
-    init_lru_crawler();
+    init_lru_crawler();//初始化LRU扫描的锁
 
     /* initialise clock event */
     clock_handler(0, 0, 0);
@@ -5580,7 +5599,7 @@ int main (int argc, char **argv) {
             }
         }
 
-        errno = 0;
+        errno = 0;//建立listen socket， 设置监听sock的各项参数，并将其加入epoll里面。监听回调为event_handler
         if (settings.port && server_sockets(settings.port, tcp_transport,
                                            portnumber_file)) {
             vperror("failed to listen on TCP port %d", settings.port);
@@ -5624,6 +5643,8 @@ int main (int argc, char **argv) {
     /* Drop privileges no longer needed */
     drop_privileges();
 
+	//进入事件循环,监听sock的回调为 event_handler,实际上等于drive_machine, 工作线程有自己的event_base_loop，各自循环自己的，由一个管道沟通。
+	//主线程accept一个连接后，调用dispatch_conn_new分配给一个工作线程，轮训
     /* enter the event loop */
     if (event_base_loop(main_base, 0) != 0) {
         retval = EXIT_FAILURE;
