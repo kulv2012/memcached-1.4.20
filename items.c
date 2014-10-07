@@ -570,6 +570,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     if (it != NULL) {
         if (settings.oldest_live != 0 && settings.oldest_live <= current_time &&
             it->time <= settings.oldest_live) {
+			//flush_all指令可以控制要不要刷掉所有时间在这之前的数据, 这算懒惰过期机制的一个
             do_item_unlink(it, hv);
             do_item_remove(it);
             it = NULL;
@@ -577,14 +578,14 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
                 fprintf(stderr, " -nuked by flush");
             }
         } else if (it->exptime != 0 && it->exptime <= current_time) {
-            do_item_unlink(it, hv);
+            do_item_unlink(it, hv);//进行懒惰过期清空
             do_item_remove(it);
             it = NULL;
             if (was_found) {
                 fprintf(stderr, " -nuked by expire");
             }
         } else {
-            it->it_flags |= ITEM_FETCHED;
+            it->it_flags |= ITEM_FETCHED;//搞定，找到了 
             DEBUG_REFCNT(it, '+');
         }
     }

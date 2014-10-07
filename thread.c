@@ -340,16 +340,15 @@ static void setup_thread(LIBEVENT_THREAD *me) {
 
 	//下面将我自己的me->notify_receive_fd管道加入到事件循环里面，监听可读事件，回调为thread_libevent_process 
     /* Listen for notifications from other threads */
-    event_set(&me->notify_event, me->notify_receive_fd,
-              EV_READ | EV_PERSIST, thread_libevent_process, me);
-    event_base_set(me->base, &me->notify_event);///设置关系
+    event_set(&me->notify_event, me->notify_receive_fd, EV_READ | EV_PERSIST, thread_libevent_process, me);
+    event_base_set(me->base, &me->notify_event);///设置关系,让me->notify_event->ev_base指向me->base。
 
-    if (event_add(&me->notify_event, 0) == -1) {//加入
+    if (event_add(&me->notify_event, 0) == -1) {//加入me->base里面
         fprintf(stderr, "Can't monitor libevent notify pipe\n");
         exit(1);
     }
 
-    me->new_conn_queue = malloc(sizeof(struct conn_queue));//上面me->notify_receive_fd用来告诉对方，有新东西了，实际上东西放在new_conn_queue里面的
+    me->new_conn_queue = malloc(sizeof(struct conn_queue));//上面me->notify_receive_fd用来告诉本线程，有新东西了，实际上东西放在new_conn_queue里面的
     if (me->new_conn_queue == NULL) {
         perror("Failed to allocate memory for connection queue");
         exit(EXIT_FAILURE);
@@ -383,10 +382,10 @@ static void *worker_libevent(void *arg) {
      * this could be unnecessary if we pass the conn *c struct through
      * all item_lock calls...
      */
-    me->item_lock_type = ITEM_LOCK_GRANULAR;
+    me->item_lock_type = ITEM_LOCK_GRANULAR;//默认数据用全局锁
     pthread_setspecific(item_lock_type_key, &me->item_lock_type);
 
-    register_thread_initialized();//释放条件变量，让主线程直到自己已经初始化完成，其实只是跑起来了。待会就进入event循环了。此时我已监听了管道receive_fd句柄
+    register_thread_initialized();//释放条件变量，让主线程知道自己已经初始化完成，其实只是跑起来了。待会就进入event循环了。此时我已监听了管道receive_fd句柄
 
 	//notify_receive_fd被加入event里面回调为thread_libevent_process  
     event_base_loop(me->base, 0);
@@ -513,8 +512,8 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
 item *item_get(const char *key, const size_t nkey) {
     item *it;
     uint32_t hv;
-    hv = hash(key, nkey);
-    item_lock(hv);
+    hv = hash(key, nkey);//默认为JENKINS_HASH jenkins_hash,得到这个key所在的存储桶
+    item_lock(hv);//任何键值访问，都加锁
     it = do_item_get(key, nkey, hv);
     item_unlock(hv);
     return it;
@@ -823,11 +822,11 @@ void thread_init(int nthreads, struct event_base *main_base) {
         perror("Can't allocate item locks");
         exit(1);
     }
-    for (i = 0; i < item_lock_count; i++) {
+    for (i = 0; i < item_lock_count; i++) {//申请1-8K左右的互斥锁,如果所级别是细粒度的，那么会启用很多互斥锁，否则是一把全局锁
         pthread_mutex_init(&item_locks[i], NULL);
     }
     pthread_key_create(&item_lock_type_key, NULL);
-    pthread_mutex_init(&item_global_lock, NULL);
+    pthread_mutex_init(&item_global_lock, NULL);//全局锁，thread_libevent_process里面控制具体使用哪一种
 
 	//为每个线程申请一个LIBEVENT_THREAD线程结构，存放event等
     threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
@@ -836,10 +835,10 @@ void thread_init(int nthreads, struct event_base *main_base) {
         exit(1);
     }
 	//
-    dispatcher_thread.base = main_base;
+    dispatcher_thread.base = main_base;//指向主线程的libevent结构
     dispatcher_thread.thread_id = pthread_self();
 
-    for (i = 0; i < nthreads; i++) {
+    for (i = 0; i < nthreads; i++) {//settings.num_threads这么多线程数分配, 默认4个
         int fds[2];
         if (pipe(fds)) {//新建一个双向管道
             perror("Can't create notify pipe");
@@ -850,6 +849,7 @@ void thread_init(int nthreads, struct event_base *main_base) {
         threads[i].notify_send_fd = fds[1];//这是发送的
 
 		//工作线程初始化，初始化里边event， 将notify_receive_fd加入event里面回调为thread_libevent_process
+		//初始化new_conn_queue队列，用来接收主线程的新连接通知
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats.reserved_fds += 5;
@@ -857,12 +857,12 @@ void thread_init(int nthreads, struct event_base *main_base) {
 
     /* Create threads after we've done all the libevent setup. */
     for (i = 0; i < nthreads; i++) {//真正创建工作线程，执行函数为worker_libevent
-        create_worker(worker_libevent, &threads[i]);
+        create_worker(worker_libevent, &threads[i]);//就pthread_create
     }
 
     /* Wait for all the threads to set themselves up before returning. */
     pthread_mutex_lock(&init_lock);
-    wait_for_thread_registration(nthreads);
+    wait_for_thread_registration(nthreads);//主线程，等着工作线程准备完毕再退出
     pthread_mutex_unlock(&init_lock);
 }
 

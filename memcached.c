@@ -51,7 +51,7 @@
 /* FreeBSD 4.x doesn't have IOV_MAX exposed. */
 #ifndef IOV_MAX
 #if defined(__FreeBSD__) || defined(__APPLE__)
-# define IOV_MAX 1024
+# define IOV_MAX 400
 #endif
 #endif
 
@@ -248,12 +248,12 @@ static void settings_init(void) {
  * Returns 0 on success, -1 on out-of-memory.
  */
 static int add_msghdr(conn *c)
-{//UDP的数据结构
+{//发送的数据结构， msghdr里面指向iov结构，后者就是data部分
     struct msghdr *msg;
 
     assert(c != NULL);
 
-    if (c->msgsize == c->msgused) {
+    if (c->msgsize == c->msgused) {//描述头不够了，扩容一倍
         msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
         if (! msg) {
             STATS_LOCK();
@@ -265,21 +265,22 @@ static int add_msghdr(conn *c)
         c->msgsize *= 2;
     }
 
-    msg = c->msglist + c->msgused;
+    msg = c->msglist + c->msgused;//msgused位置，就是可以使用的空闲位置
 
     /* this wipes msg_iovlen, msg_control, msg_controllen, and
        msg_flags, the last 3 of which aren't defined on solaris: */
     memset(msg, 0, sizeof(struct msghdr));
 
-    msg->msg_iov = &c->iov[c->iovused];
+	printf("add_msghdr c->iovused:%d, iovsize:%d\n", c->iovused, c->iovsize) ;
+    msg->msg_iov = &c->iov[c->iovused];//不用担心数目是否足够，因为上层保证至少iov有一个空闲的? 后续详细看看,是吗?
 
     if (IS_UDP(c->transport) && c->request_addr_size > 0) {
-        msg->msg_name = &c->request_addr;
+        msg->msg_name = &c->request_addr;//UDP需要用这个来当地址
         msg->msg_namelen = c->request_addr_size;
     }
 
-    c->msgbytes = 0;
-    c->msgused++;
+    c->msgbytes = 0;//这个的意思是，本连接，当前最新的msghdr所包含的数据多少
+    c->msgused++;//指向下一个结构
 
     if (IS_UDP(c->transport)) {
         /* Leave room for the UDP header, which we'll fill in later. */
@@ -694,8 +695,9 @@ static void conn_set_state(conn *c, enum conn_states state) {
 static int ensure_iov_space(conn *c) {
     assert(c != NULL);
 
-    if (c->iovused >= c->iovsize) {
+    if (c->iovused >= c->iovsize) {//全部用完了，只能重新申请一个了。指数上升
         int i, iovnum;
+		//默认iovsize 为IOV_LIST_INITIAL， 也就是400
         struct iovec *new_iov = (struct iovec *)realloc(c->iov,
                                 (c->iovsize * 2) * sizeof(struct iovec));
         if (! new_iov) {
@@ -706,11 +708,12 @@ static int ensure_iov_space(conn *c) {
         }
         c->iov = new_iov;
         c->iovsize *= 2;
+		printf("ensure_iov_space, newsize:%d\n", c->iovsize);
 
         /* Point all the msghdr structures at the new list. */
         for (i = 0, iovnum = 0; i < c->msgused; i++) {
             c->msglist[i].msg_iov = &c->iov[iovnum];
-            iovnum += c->msglist[i].msg_iovlen;
+            iovnum += c->msglist[i].msg_iovlen;//msg_iovlen为这个header的msg_iov所指向的iov的数目,所以不是同步跳动的,因此这里不可回跳
         }
     }
 
@@ -732,7 +735,7 @@ static int add_iov(conn *c, const void *buf, int len) {
 
     assert(c != NULL);
 
-    do {
+    do {//这个循环是因为一个UDP数据包最大只能是UDP_MAX_PAYLOAD_SIZE， 1400， 所以得拆包。TCP也顺带做了
         m = &c->msglist[c->msgused - 1];
 
         /*
@@ -742,32 +745,36 @@ static int add_iov(conn *c, const void *buf, int len) {
         limit_to_mtu = IS_UDP(c->transport) || (1 == c->msgused);
 
         /* We may need to start a new msghdr if this one is full. */
+		//这里是说，一块消息头所指向的iov数组项太多了，或者本块
         if (m->msg_iovlen == IOV_MAX ||
             (limit_to_mtu && c->msgbytes >= UDP_MAX_PAYLOAD_SIZE)) {
-            add_msghdr(c);
-            m = &c->msglist[c->msgused - 1];
+            add_msghdr(c);//里面会增加c->msgused++;不用担心iov数目是否足够，至少保证有1个的
+			//是吗？这个函数一定有个前提就是iov数组足够？？至少有一个空的？不信 ps: http://chenzhenianqing.cn/articles/1251.html
+            m = &c->msglist[c->msgused - 1];//msgused - 1 就是刚才新增加的那个头
         }
-
-        if (ensure_iov_space(c) != 0)
+		//test
+		m->msg_iov[m->msg_iovlen].iov_len = len; 
+        if (ensure_iov_space(c) != 0)//这里安全么，add_msghdr依赖这里来确保空间 
             return -1;
 
+		//一个msghdr最多能容纳1400个字节的数据，多了就只能拆了
         /* If the fragment is too big to fit in the datagram, split it up */
-        if (limit_to_mtu && len + c->msgbytes > UDP_MAX_PAYLOAD_SIZE) {
+        if (limit_to_mtu && len + c->msgbytes > UDP_MAX_PAYLOAD_SIZE) {//如果数据包太大，就需要拆包，分多次发送
             leftover = len + c->msgbytes - UDP_MAX_PAYLOAD_SIZE;
             len -= leftover;
         } else {
             leftover = 0;
         }
-
+printf("add_iov add buf[%s] len[%d] IOV_MAX[%d] m->msg_iovlen:%ld c->iovused:%d\n", (char*)buf, len, IOV_MAX, m->msg_iovlen, c->iovused);
         m = &c->msglist[c->msgused - 1];
-        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
+        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;//指向数据部分，这个数据不需要释放，因为上层可能传递常量
         m->msg_iov[m->msg_iovlen].iov_len = len;
 
         c->msgbytes += len;
-        c->iovused++;
-        m->msg_iovlen++;
+        c->iovused++;//iov数组增加
+        m->msg_iovlen++;//这个头所代表的iov数组的数目，也增加，这样内核可以一块整个使用
 
-        buf = ((char *)buf) + len;
+        buf = ((char *)buf) + len;//拆分数据
         len = leftover;
     } while (leftover > 0);
 
@@ -2869,7 +2876,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
             key = key_token->value;
             nkey = key_token->length;
 
-            if(nkey > KEY_MAX_LENGTH) {
+            if(nkey > KEY_MAX_LENGTH) {//key最长250个字符
                 out_string(c, "CLIENT_ERROR bad command line format");
                 while (i-- > 0) {
                     item_remove(*(c->ilist + i));
@@ -2902,6 +2909,12 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                  *   "VALUE "
                  *   key
                  *   " " + flags + " " + data length + "\r\n" + data (with \r\n)
+				 *   get aaaa
+				 *   返回格式是这样的：
+				 *   "VALUE aaaa 0 5
+				 *   12345
+				 *   END
+				 *   "
                  */
 
                 if (return_cas)
@@ -2954,10 +2967,16 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 {
                   MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
                                         it->nbytes, ITEM_get_cas(it));
+				  /*
+				   *
+				   VALUE aaaa 0 5
+				   12345
+				   END
+				   */
                   if (add_iov(c, "VALUE ", 6) != 0 ||
                       add_iov(c, ITEM_key(it), it->nkey) != 0 ||
                       add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
-                      {
+                      {//第一行： VALUE aaaa 0 5
                           item_remove(it);
                           break;
                       }
@@ -2982,7 +3001,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 *(c->ilist + i) = it;
                 i++;
 
-            } else {
+            } else {//没找到，只能放弃了
                 pthread_mutex_lock(&c->thread->stats.mutex);
                 c->thread->stats.get_misses++;
                 c->thread->stats.get_cmds++;
@@ -2990,7 +3009,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
             }
 
-            key_token++;
+            key_token++;//继续处理下一个get参数局的key
         }
 
         /*
@@ -3024,7 +3043,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
         out_of_memory(c, "SERVER_ERROR out of memory writing get response");
     }
     else {
-        conn_set_state(c, conn_mwrite);
+        conn_set_state(c, conn_mwrite);//数据已经准备好了，该写数据给对方
         c->msgcurr = 0;
     }
 }
@@ -3430,7 +3449,7 @@ static void process_command(conn *c, char *command) {
         ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
          (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
 
-        process_get_command(c, tokens, ntokens, false);
+        process_get_command(c, tokens, ntokens, false);//处理get指令
 
     } else if ((ntokens == 6 || ntokens == 7) &&
                ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
@@ -3764,7 +3783,7 @@ static int try_read_command(conn *c) {
 
         assert(cont <= (c->rcurr + c->rbytes));
 
-        c->last_cmd_time = current_time;//主动更新的时间戳
+        c->last_cmd_time = current_time;//主动更新的时间戳, current_time由定时器每秒更新 
         process_command(c, c->rcurr);
 
         c->rbytes -= (cont - c->rcurr);
@@ -3827,7 +3846,7 @@ static enum try_read_result try_read_udp(conn *c) {
  * @return enum try_read_result
  */
 static enum try_read_result try_read_network(conn *c) {
-	//老办法， 异步读取数据，知道读满或者没东西了
+	//老办法， 异步读取数据，直到读满或者没东西了
     enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
     int res;
     int num_allocs = 0;
@@ -3854,7 +3873,7 @@ static enum try_read_result try_read_network(conn *c) {
                     fprintf(stderr, "Couldn't realloc input buffer\n");
                 }
                 c->rbytes = 0; /* ignore what we read */
-                out_of_memory(c, "SERVER_ERROR out of memory reading request");
+                out_of_memory(c, "SERVER_ERROR out of memory reading request");//发送错误码，这样会设置连接状态为: conn_write， 写完后，设置为下面的状态
                 c->write_and_go = conn_closing;//关闭连接，在上层的时候下一次while会干掉的
                 return READ_MEMORY_ERROR;
             }
@@ -4110,6 +4129,7 @@ static void drive_machine(conn *c) {
                 /* State already set by try_read_network */
                 break;
             }
+			//注意这里没有设置stop=true， 所以如果数据还没有读完，还会循环一次到上面的conn_waiting
             break;
 
         case conn_parse_cmd :
@@ -4541,7 +4561,7 @@ static int server_socket(const char *interface,
             }
         }
 
-        if (IS_UDP(transport)) {//如果是UDP协议，那么直接将这个监听端口分破给num_threads_per_udp个线程，让他们一起处理
+        if (IS_UDP(transport)) {//如果是UDP协议，那么直接将这个监听端口分配给num_threads_per_udp个线程，让他们一起处理
 			//因为是数据报文，接收的时候是一个报文一个报文接收，所以随便某个线程接收了都行，不需要accept。
             int c;
 
@@ -5013,7 +5033,7 @@ static int enable_large_pages(void) {
  * Do basic sanity check of the runtime environment
  * @return true if no errors found, false if we can't use this env
  */
-static bool sanitycheck(void) {
+static bool sanitycheck(void) {//检查了一下libevent的版本号
     /* One of our biggest problems is old and bogus libevents */
     const char *ever = event_get_version();
     if (ever != NULL) {
@@ -5082,15 +5102,15 @@ int main (int argc, char **argv) {
         NULL
     };
 
-    if (!sanitycheck()) {
+    if (!sanitycheck()) {//检查了一下libevent的版本号
         return EX_OSERR;
     }
 
     /* handle SIGINT */
-    signal(SIGINT, sig_handler);
+    signal(SIGINT, sig_handler);//就打印了一下print
 
     /* init settings */
-    settings_init();
+    settings_init();//初始化settings全局配置数据 
 
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
@@ -5444,7 +5464,7 @@ int main (int argc, char **argv) {
         settings.port = settings.udpport;
     }
 
-    if (maxcore != 0) {
+    if (maxcore != 0) {//提升rlimit
         struct rlimit rlim_new;
         /*
          * First try raising to infinity; if that fails, try bringing
@@ -5510,7 +5530,7 @@ int main (int argc, char **argv) {
 
     /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
-    if (do_daemonize) {
+    if (do_daemonize) {//后台运行
         if (sigignore(SIGHUP) == -1) {
             perror("Failed to ignore SIGHUP");
         }
@@ -5534,12 +5554,12 @@ int main (int argc, char **argv) {
     }
 
     /* initialize main thread libevent instance */
-    main_base = event_init();
+    main_base = event_init();//初始化主线程的libevent结构 
 
     /* initialize other stuff */
     stats_init();
     assoc_init(settings.hashpower_init);
-    conn_init();//默认分配200个连接结构
+    conn_init();//默认将setting.maxconns的连接结构指针申请好，后面就可以直接用fd来进行索引了 
     slabs_init(settings.maxbytes, settings.factor, preallocate);
 
     /*
@@ -5555,7 +5575,7 @@ int main (int argc, char **argv) {
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);//默认4个线程,启动其libevet结构。设置监听管道，管道用来让主线程告诉自己，有新事件了
 	//上面工作线程已经准备好了，下面主线程终于可以设置自己的东西了，比如打开LISTEN socket，进行accepted监听。
-	//memcached的模式为：主线程负责accept，完了管道告诉工作线程去处理实际的请求。2着不同的event_base
+	//memcached的模式为：主线程负责accept，完了管道告诉工作线程去处理实际的请求。2者不同的event_base
 
     if (start_assoc_maintenance_thread() == -1) {//启动维护线程
         exit(EXIT_FAILURE);
@@ -5570,7 +5590,7 @@ int main (int argc, char **argv) {
     init_lru_crawler();//初始化LRU扫描的锁
 
     /* initialise clock event */
-    clock_handler(0, 0, 0);
+    clock_handler(0, 0, 0);//定时器，每秒触发，放在main_base里面
 
     /* create unix mode sockets after dropping privileges */
     if (settings.socketpath != NULL) {
@@ -5587,7 +5607,7 @@ int main (int argc, char **argv) {
         char temp_portnumber_filename[PATH_MAX];
         FILE *portnumber_file = NULL;
 
-        if (portnumber_filename != NULL) {
+        if (portnumber_filename != NULL) {//为每个端口打开了一个端口文件，用来加锁的吧
             snprintf(temp_portnumber_filename,
                      sizeof(temp_portnumber_filename),
                      "%s.lck", portnumber_filename);
@@ -5643,12 +5663,16 @@ int main (int argc, char **argv) {
     /* Drop privileges no longer needed */
     drop_privileges();
 
-	//进入事件循环,监听sock的回调为 event_handler,实际上等于drive_machine, 工作线程有自己的event_base_loop，各自循环自己的，由一个管道沟通。
+	//进入事件循环,监听sock的回调为 event_handler,实际上等于drive_machine, 
+	//工作线程有自己的event_base_loop，其跟主线程通信用管道，libevent回调函数为thread_libevent_process， 但可读写事件还是event_handler
+	//工作线程各自循环自己的，由一个管道沟通。
 	//主线程accept一个连接后，调用dispatch_conn_new分配给一个工作线程，轮训
     /* enter the event loop */
     if (event_base_loop(main_base, 0) != 0) {
         retval = EXIT_FAILURE;
     }
+
+	//到这里就是结束了。清理一下
 
     stop_assoc_maintenance_thread();
 

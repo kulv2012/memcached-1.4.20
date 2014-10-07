@@ -45,7 +45,8 @@
 #define SUFFIX_LIST_INITIAL 20
 
 /** Initial size of the sendmsg() scatter/gather array. */
-#define IOV_LIST_INITIAL 400
+#define IOV_LIST_INITIAL 1
+//#define IOV_LIST_INITIAL 400
 
 /** Initial number of sendmsg() argument structures to allocate. */
 #define MSG_LIST_INITIAL 10
@@ -450,7 +451,7 @@ struct conn {
     int    msgsize;   /* number of elements allocated in msglist[] */
     int    msgused;   /* number of elements used in msglist[] */
     int    msgcurr;   /* element in msglist[] being transmitted now */
-    int    msgbytes;  /* number of bytes in current msg */
+    int    msgbytes;  /* number of bytes in current msg */ //这个的意思是，本连接，当前最新的msghdr所包含的数据多少
 
     item   **ilist;   /* list of items to write out */
     int    isize;
