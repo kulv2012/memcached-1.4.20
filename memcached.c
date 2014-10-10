@@ -486,7 +486,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     return c;
 }
 
-static void conn_release_items(conn *c) {
+static void conn_release_items(conn *c) {//将一个连接所涉及到的item给解除引用，因为数据已经发送完成了
     assert(c != NULL);
 
     if (c->item) {
@@ -497,7 +497,7 @@ static void conn_release_items(conn *c) {
     while (c->ileft > 0) {
         item *it = *(c->icurr);
         assert((it->it_flags & ITEM_SLABBED) == 0);
-        item_remove(it);
+        item_remove(it);//减少引用计数
         c->icurr++;
         c->ileft--;
     }
@@ -508,7 +508,7 @@ static void conn_release_items(conn *c) {
         }
     }
 
-    c->icurr = c->ilist;
+    c->icurr = c->ilist;//指向头部
     c->suffixcurr = c->suffixlist;
 }
 
@@ -729,6 +729,7 @@ static int ensure_iov_space(conn *c) {
  */
 
 static int add_iov(conn *c, const void *buf, int len) {
+	//iov操作中，实际上要发送的数据都不是拷贝的，而是直接指向其他结构，因此调用方要保证合理时机释放内存。
     struct msghdr *m;
     int leftover;
     bool limit_to_mtu;
@@ -753,7 +754,7 @@ static int add_iov(conn *c, const void *buf, int len) {
             m = &c->msglist[c->msgused - 1];//msgused - 1 就是刚才新增加的那个头
         }
 		//test
-		m->msg_iov[m->msg_iovlen].iov_len = len; 
+
         if (ensure_iov_space(c) != 0)//这里安全么，add_msghdr依赖这里来确保空间 
             return -1;
 
@@ -2884,7 +2885,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 return;
             }
 
-            it = item_get(key, nkey);
+            it = item_get(key, nkey);//获取值，里面自动增加引用计数了的。refcount_incr(&it->refcount);
             if (settings.detail_enabled) {
                 stats_prefix_record_get(key, nkey, NULL != it);
             }
@@ -2963,19 +2964,18 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                           break;
                       }
                 }
-                else
-                {
+                else 
+                {// not return_cas
                   MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
                                         it->nbytes, ITEM_get_cas(it));
-				  /*
-				   *
+				  /* 拼接如下结构给客户端
 				   VALUE aaaa 0 5
 				   12345
 				   END
 				   */
-                  if (add_iov(c, "VALUE ", 6) != 0 ||
-                      add_iov(c, ITEM_key(it), it->nkey) != 0 ||
-                      add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
+                  if (add_iov(c, "VALUE ", 6) != 0 || //"VALUE "
+                      add_iov(c, ITEM_key(it), it->nkey) != 0 || //"aaaa"
+                      add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0) // " 0 5\r\n12345\r\n"
                       {//第一行： VALUE aaaa 0 5
                           item_remove(it);
                           break;
@@ -2997,9 +2997,9 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 c->thread->stats.slab_stats[it->slabs_clsid].get_hits++;
                 c->thread->stats.get_cmds++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
-                item_update(it);
-                *(c->ilist + i) = it;
-                i++;
+                item_update(it);//更新访问时间等
+                *(c->ilist + i) = it;//it的数据被指向了，不要轻易删除， 在上面已经增加了引用计数丶，因此将其指针挂载到ilist。发送完数据后就减少引用
+                i++;//item_get 自动增加引用计数了的
 
             } else {//没找到，只能放弃了
                 pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3023,7 +3023,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
     } while(key_token->value != NULL);
 
-    c->icurr = c->ilist;
+    c->icurr = c->ilist;//引用计数操作
     c->ileft = i;
     if (return_cas) {
         c->suffixcurr = c->suffixlist;
@@ -3039,11 +3039,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
         in \r\n. So we send SERVER_ERROR instead.
     */
     if (key_token->value != NULL || add_iov(c, "END\r\n", 5) != 0
-        || (IS_UDP(c->transport) && build_udp_headers(c) != 0)) {
+        || (IS_UDP(c->transport) && build_udp_headers(c) != 0)) { //发送END结束符
         out_of_memory(c, "SERVER_ERROR out of memory writing get response");
     }
     else {
-        conn_set_state(c, conn_mwrite);//数据已经准备好了，该写数据给对方
+        conn_set_state(c, conn_mwrite);//数据已经准备好了，该写数据给对方了，后面进入写数据过程
         c->msgcurr = 0;
     }
 }
@@ -4116,7 +4116,7 @@ static void drive_machine(conn *c) {
             res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
 
             switch (res) {
-            case READ_NO_DATA_RECEIVED:
+            case READ_NO_DATA_RECEIVED://没收到数据或者不够，没有读完一条指令
                 conn_set_state(c, conn_waiting);//
                 break;
             case READ_DATA_RECEIVED:
@@ -4300,29 +4300,29 @@ static void drive_machine(conn *c) {
 
             /* fall through... */
 
-        case conn_mwrite:
+        case conn_mwrite://写数据给客户端。一次写多份
           if (IS_UDP(c->transport) && c->msgcurr == 0 && build_udp_headers(c) != 0) {
             if (settings.verbose > 0)
               fprintf(stderr, "Failed to build UDP headers\n");
             conn_set_state(c, conn_closing);
             break;
           }
-            switch (transmit(c)) {
+            switch (transmit(c)) {///发送数据
             case TRANSMIT_COMPLETE:
-                if (c->state == conn_mwrite) {
-                    conn_release_items(c);
+                if (c->state == conn_mwrite) {//高级送方式
+                    conn_release_items(c);//将一个连接所涉及到的item给解除引用，因为数据已经发送完成了
                     /* XXX:  I don't know why this wasn't the general case */
                     if(c->protocol == binary_prot) {
                         conn_set_state(c, c->write_and_go);
                     } else {
-                        conn_set_state(c, conn_new_cmd);
+                        conn_set_state(c, conn_new_cmd);//继续读取数据
                     }
                 } else if (c->state == conn_write) {
                     if (c->write_and_free) {
                         free(c->write_and_free);
                         c->write_and_free = 0;
                     }
-                    conn_set_state(c, c->write_and_go);
+                    conn_set_state(c, c->write_and_go);//设置为写数据后要设置的那个状态，这个一般在设置IFA送数据的时候会设置write_and_go
                 } else {
                     if (settings.verbose > 0)
                         fprintf(stderr, "Unexpected state %d\n", c->state);

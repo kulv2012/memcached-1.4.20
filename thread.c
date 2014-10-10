@@ -547,7 +547,7 @@ int item_link(item *item) {
  * Decrements the reference count on an item and adds it to the freelist if
  * needed.
  */
-void item_remove(item *item) {
+void item_remove(item *item) {//减少引用计数
     uint32_t hv;
     hv = hash(ITEM_key(item), item->nkey);
 
@@ -584,7 +584,7 @@ void item_update(item *item) {
     hv = hash(ITEM_key(item), item->nkey);
 
     item_lock(hv);
-    do_item_update(item);
+    do_item_update(item);//更新其访问时间，移动到链表头部等
     item_unlock(hv);
 }
 

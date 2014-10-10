@@ -99,6 +99,7 @@
 #define ITEM_key(item) (((char*)&((item)->data)) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
+//跳过key的部分后面的部分，可能有cas数据，固定8个字节
 #define ITEM_suffix(item) ((char*) &((item)->data) + (item)->nkey + 1 \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
@@ -453,7 +454,7 @@ struct conn {
     int    msgcurr;   /* element in msglist[] being transmitted now */
     int    msgbytes;  /* number of bytes in current msg */ //这个的意思是，本连接，当前最新的msghdr所包含的数据多少
 
-    item   **ilist;   /* list of items to write out */
+    item   **ilist;   /* list of items to write out *///要发送给客户端的数据item，在这里都有指向，这个用来保持引用计数的。
     int    isize;
     item   **icurr;
     int    ileft;

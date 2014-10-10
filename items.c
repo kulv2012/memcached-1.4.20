@@ -269,7 +269,7 @@ static void item_link_q(item *it) { /* item is the new head */
     if (it->next) it->next->prev = it;
     *head = it;
     if (*tail == 0) *tail = it;
-    sizes[it->slabs_clsid]++;
+    sizes[it->slabs_clsid]++;//增加这个槽位的item数目
     return;
 }
 
@@ -292,7 +292,7 @@ static void item_unlink_q(item *it) {
 
     if (it->next) it->next->prev = it->prev;
     if (it->prev) it->prev->next = it->next;
-    sizes[it->slabs_clsid]--;
+    sizes[it->slabs_clsid]--;//减少这个位的item数目
     return;
 }
 
@@ -350,7 +350,7 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
     }
 }
 
-void do_item_remove(item *it) {
+void do_item_remove(item *it) {//其实就是减少引用计数
     MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
     assert(it->refcount > 0);
@@ -360,15 +360,15 @@ void do_item_remove(item *it) {
     }
 }
 
-void do_item_update(item *it) {
+void do_item_update(item *it) {//定期更新一个item的访问时间，然后将其移动到链表头部 
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
-    if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+    if (it->time < current_time - ITEM_UPDATE_INTERVAL) {//每60秒才对一个item更新一次，避免频繁的操作
         assert((it->it_flags & ITEM_SLABBED) == 0);
 
         mutex_lock(&cache_lock);
         if ((it->it_flags & ITEM_LINKED) != 0) {
             item_unlink_q(it);
-            it->time = current_time;
+            it->time = current_time;//从链表里面删掉，然后更新访问时间，然后再加进去，这样相当于放到了头部
             item_link_q(it);
         }
         mutex_unlock(&cache_lock);
