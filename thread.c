@@ -123,8 +123,8 @@ void item_unlock_global(void) {
 
 void item_lock(uint32_t hv) {
     uint8_t *lock_type = pthread_getspecific(item_lock_type_key);
-    if (likely(*lock_type == ITEM_LOCK_GRANULAR)) {
-        mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
+    if (likely(*lock_type == ITEM_LOCK_GRANULAR)) {//默认
+        mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);//在thread_init 里面初始化设置的互斥锁，用来加锁item的
     } else {
         mutex_lock(&item_global_lock);
     }
@@ -382,7 +382,7 @@ static void *worker_libevent(void *arg) {
      * this could be unnecessary if we pass the conn *c struct through
      * all item_lock calls...
      */
-    me->item_lock_type = ITEM_LOCK_GRANULAR;//默认数据用全局锁
+    me->item_lock_type = ITEM_LOCK_GRANULAR;//默认数据用局部
     pthread_setspecific(item_lock_type_key, &me->item_lock_type);
 
     register_thread_initialized();//释放条件变量，让主线程知道自己已经初始化完成，其实只是跑起来了。待会就进入event循环了。此时我已监听了管道receive_fd句柄
@@ -399,6 +399,7 @@ static void *worker_libevent(void *arg) {
  */
 static void thread_libevent_process(int fd, short which, void *arg) {
 	//threads[i].notify_receive_fd管道的事件监听函数，在setup_thread里面设置的
+	//工作线程的管道是这个回调函数，客户端连接是event_handler
     LIBEVENT_THREAD *me = arg;
     CQ_ITEM *item;
     char buf[1];
@@ -818,11 +819,11 @@ void thread_init(int nthreads, struct event_base *main_base) {
     item_lock_hashpower = power;
 
     item_locks = calloc(item_lock_count, sizeof(pthread_mutex_t));
-    if (! item_locks) {
+    if (! item_locks) {//这个锁是用来在访问key的时候加锁的
         perror("Can't allocate item locks");
         exit(1);
     }
-    for (i = 0; i < item_lock_count; i++) {//申请1-8K左右的互斥锁,如果所级别是细粒度的，那么会启用很多互斥锁，否则是一把全局锁
+    for (i = 0; i < item_lock_count; i++) {//申请1-8K左右的互斥锁,如果锁级别是细粒度的，那么会启用很多互斥锁，否则是一把全局锁
         pthread_mutex_init(&item_locks[i], NULL);
     }
     pthread_key_create(&item_lock_type_key, NULL);

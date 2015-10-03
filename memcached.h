@@ -298,7 +298,7 @@ struct settings {
     int udpport;
     char *inter;
     int verbose;
-    rel_time_t oldest_live; /* ignore existing items older than this */
+    rel_time_t oldest_live; /* ignore existing items older than this *///时间戳在这个之前的key，全部删除
     int evict_to_free;
     char *socketpath;   /* path to unix socket if using local socket */
     int access;  /* access mask (a la chmod) for unix domain socket */

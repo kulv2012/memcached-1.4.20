@@ -32,7 +32,7 @@ typedef  unsigned long  int  ub4;   /* unsigned 4-byte quantities */
 typedef  unsigned       char ub1;   /* unsigned 1-byte quantities */
 
 /* how many powers of 2's worth of buckets we use */
-unsigned int hashpower = HASHPOWER_DEFAULT;
+unsigned int hashpower = HASHPOWER_DEFAULT;////有2^n次方个bucket槽位，每个槽位是个链表 ,默认2^16个槽位
 
 #define hashsize(n) ((ub4)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
@@ -80,17 +80,17 @@ item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
 
     if (expanding &&
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
-    {
+    {//这个槽位位于当前正在迁移的bucket之后，所以使用旧数据
         it = old_hashtable[oldbucket];
-    } else {
+    } else {//使用新数据
         it = primary_hashtable[hv & hashmask(hashpower)];
     }
 
     item *ret = NULL;
     int depth = 0;
-    while (it) {
+    while (it) {//需要遍历这个槽位里面的链表
         if ((nkey == it->nkey) && (memcmp(key, ITEM_key(it), nkey) == 0)) {
-            ret = it;
+            ret = it;//先看长度，否则后移
             break;
         }
         it = it->h_next;

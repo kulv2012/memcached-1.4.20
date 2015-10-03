@@ -93,6 +93,8 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     uint8_t nsuffix;
     item *it = NULL;
     char suffix[40];
+	//算一下需要多长的内存，用来决定slab的桶. 大小为： sizeof(item) + nkey+1 + " %flags %nbytes-2\r\n" + nbytes
+	//其实就是把命令转为字符串 
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
     if (settings.use_cas) {
         ntotal += sizeof(uint64_t);

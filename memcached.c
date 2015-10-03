@@ -153,6 +153,10 @@ static void maxconns_handler(const int fd, const short which, void *arg) {
  * be that low).
  */
 static rel_time_t realtime(const time_t exptime) {
+	/*expiretime参数要么是个大于28天的秒数的时间戳，并且大于服务器启动的时间戳，也就是说，确保这个是个时间戳，
+	 * 或者为最大30天的秒数，代表从现在起，多少秒过期
+		*
+	 * */
     /* no. of seconds in 30 days - largest possible delta exptime */
 
     if (exptime == 0) return 0; /* 0 means never expire */
@@ -165,10 +169,10 @@ static rel_time_t realtime(const time_t exptime) {
            future, effectively making items expiring in the past
            really expiring never */
         if (exptime <= process_started)
-            return (rel_time_t)1;
-        return (rel_time_t)(exptime - process_started);
+            return (rel_time_t)1;//1秒后过期
+        return (rel_time_t)(exptime - process_started);//返回的是服务器启动后多少秒过期
     } else {
-        return (rel_time_t)(exptime + current_time);
+        return (rel_time_t)(exptime + current_time);//在这个时间戳之后过期
     }
 }
 
@@ -265,7 +269,7 @@ static int add_msghdr(conn *c)
         c->msgsize *= 2;
     }
 
-    msg = c->msglist + c->msgused;//msgused位置，就是可以使用的空闲位置
+    msg = c->msglist + c->msgused;//msgused位置，就是可以使用的空闲位置,这里没有判断越界，上层会做额外判断的
 
     /* this wipes msg_iovlen, msg_control, msg_controllen, and
        msg_flags, the last 3 of which aren't defined on solaris: */
@@ -2894,7 +2898,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                     item **new_list = realloc(c->ilist, sizeof(item *) * c->isize * 2);
                     if (new_list) {
                         c->isize *= 2;
-                        c->ilist = new_list;
+                        c->ilist = new_list;//记住这个item，保留其引用技计数。
                     } else {
                         STATS_LOCK();
                         stats.malloc_fails++;
@@ -3049,6 +3053,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 }
 
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
+	//解析 "set aaa 0 0 5" 指令，申请内存用来后续存放数据部分的内容， 注意这里只是申请没存，没做其他操作
     char *key;
     size_t nkey;
     unsigned int flags;
@@ -3069,10 +3074,10 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
     key = tokens[KEY_TOKEN].value;
     nkey = tokens[KEY_TOKEN].length;
-
-    if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags)
-           && safe_strtol(tokens[3].value, &exptime_int)
-           && safe_strtol(tokens[4].value, (int32_t *)&vlen))) {
+	//set aaa 0 0 5 
+    if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags) //标记字段
+           && safe_strtol(tokens[3].value, &exptime_int) //过期时间
+           && safe_strtol(tokens[4].value, (int32_t *)&vlen))) { //数据部分的长度
         out_string(c, "CLIENT_ERROR bad command line format");
         return;
     }
@@ -3084,7 +3089,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
        immediately expire values that are greater than REALTIME_MAXDELTA, but less
        than process_started, so lets aim for that. */
     if (exptime < 0)
-        exptime = REALTIME_MAXDELTA + 1;
+        exptime = REALTIME_MAXDELTA + 1;//如果传递0过去，那么最长时间是30天
 
     // does cas value exist?
     if (handle_cas) {
@@ -3100,19 +3105,19 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         return;
     }
 
-    if (settings.detail_enabled) {
+    if (settings.detail_enabled) {//记录特殊的记录
         stats_prefix_record_set(key, nkey);
     }
 
     it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
 
-    if (it == 0) {
+    if (it == 0) {//申请失败，
         if (! item_size_ok(nkey, flags, vlen))
             out_string(c, "SERVER_ERROR object too large for cache");
         else
             out_of_memory(c, "SERVER_ERROR out of memory storing object");
         /* swallow the data line */
-        c->write_and_go = conn_swallow;
+        c->write_and_go = conn_swallow;//忽略数据，要吞vlen多数据
         c->sbytes = vlen;
 
         /* Avoid stale data persisting in cache because we failed alloc.
@@ -3131,7 +3136,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
     c->item = it;
     c->ritem = ITEM_data(it);
-    c->rlbytes = it->nbytes;
+    c->rlbytes = it->nbytes;//在这里标记一下，我还需要读取多少数据。读取完成后，会调用complete_nread发送SOTRED给客户端
     c->cmd = comm;
     conn_set_state(c, conn_nread);
 }
@@ -3438,7 +3443,7 @@ static void process_command(conn *c, char *command) {
     c->msgcurr = 0;
     c->msgused = 0;
     c->iovused = 0;
-    if (add_msghdr(c) != 0) {//准备UDP的数据结构 
+    if (add_msghdr(c) != 0) {//准备发送的数据结构 ，其实是c->msgused++，空出一个msglist[]成员待会用
         out_of_memory(c, "SERVER_ERROR out of memory preparing response");
         return;
     }
@@ -4169,9 +4174,9 @@ static void drive_machine(conn *c) {
             }
             break;
 
-        case conn_nread:
+        case conn_nread://需要读取c->rlbytes个字节的数据
             if (c->rlbytes == 0) {
-                complete_nread(c);
+                complete_nread(c);//读取完毕了。
                 break;
             }
 
