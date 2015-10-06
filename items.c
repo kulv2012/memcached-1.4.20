@@ -31,8 +31,9 @@ typedef struct {
     uint64_t crawler_reclaimed;
 } itemstats_t;
 
+//下面是slabs_clsid的数组，用来链接每一个item，用来管理，比如要申请新it的时候，先看看tails末尾有没有正要过期的item，用来快速复用等
 static item *heads[LARGEST_ID];
-static item *tails[LARGEST_ID];
+static item *tails[LARGEST_ID];//
 static crawler crawlers[LARGEST_ID];
 static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
@@ -90,6 +91,10 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
 item *do_item_alloc(char *key, const size_t nkey, const int flags,
                     const rel_time_t exptime, const int nbytes,
                     const uint32_t cur_hv) {
+	//申请一个item，方法有：
+	//1. 从当前这个slabs_clsid里面扫描最旧的item，看有没有过期的；
+	//2. 用slabs_alloc 申请一个新的；
+	//3. 如果slabs_alloc 申请失败，且evict_to_free开关打开了(默认打开)，就强制删掉一个最旧的
     uint8_t nsuffix;
     item *it = NULL;
     char suffix[40];
@@ -100,7 +105,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         ntotal += sizeof(uint64_t);
     }
 
-    unsigned int id = slabs_clsid(ntotal);
+    unsigned int id = slabs_clsid(ntotal);//根据数据大小，找一个合适的slab槽
     if (id == 0)
         return 0;
 
@@ -115,21 +120,21 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     search = tails[id];
     /* We walk up *only* for locked items. Never searching for expired.
      * Waste of CPU for almost all deployments */
-    for (; tries > 0 && search != NULL; tries--, search=search->prev) {
+    for (; tries > 0 && search != NULL; tries--, search=search->prev) {//从这个slab链表的尾部扫描，看有没有要过期的，正好用它
         if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
             /* We are a crawler, ignore it. */
             tries++;
             continue;
         }
-        uint32_t hv = hash(ITEM_key(search), search->nkey);
+        uint32_t hv = hash(ITEM_key(search), search->nkey);//找到这个slab槽后面的it，取得他在hash槽中的位置hv
         /* Attempt to hash item lock the "search" item. If locked, no
          * other callers can incr the refcount
          */
         /* Don't accidentally grab ourselves, or bail if we can't quicklock */
-        if (hv == cur_hv || (hold_lock = item_trylock(hv)) == NULL)
+        if (hv == cur_hv || (hold_lock = item_trylock(hv)) == NULL)//不碰我自己的hash槽位里面的东西
             continue;
         /* Now see if the item is refcount locked */
-        if (refcount_incr(&search->refcount) != 2) {
+        if (refcount_incr(&search->refcount) != 2) {//先暴力增加一下引用计数，避免下面回收过期item的时候，直接给free了
             refcount_decr(&search->refcount);
             /* Old rare bug could cause a refcount leak. We haven't seen
              * it in years, but we leave this code in to prevent failures
@@ -147,23 +152,24 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
 
         /* Expired or flushed */
         if ((search->exptime != 0 && search->exptime < current_time)
-            || (search->time <= oldest_live && oldest_live <= current_time)) {
+            || (search->time <= oldest_live && oldest_live <= current_time)) {//找到了一个已经过期的it了，准备用它
             itemstats[id].reclaimed++;
             if ((search->it_flags & ITEM_FETCHED) == 0) {
                 itemstats[id].expired_unfetched++;
             }
             it = search;
-            slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
-            do_item_unlink_nolock(it, hv);
+            slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);//更新统计数据
+            do_item_unlink_nolock(it, hv);//从hash和slab链表里面都删除这个it
             /* Initialize the item block: */
-            it->slabs_clsid = 0;
+            it->slabs_clsid = 0;//临时清空一下，下面还是会设置为id的
         } else if ((it = slabs_alloc(ntotal, id)) == NULL) {
+			//这里很巧妙，如果申请成功了，自然不会进去，如果失败了，就进去用当前这个item，清空他，然后使用
             tried_alloc = 1;
             if (settings.evict_to_free == 0) {
                 itemstats[id].outofmemory++;
-            } else {
+            } else {//干掉一个本slabs_clsid里面最旧的item
                 itemstats[id].evicted++;
-                itemstats[id].evicted_time = current_time - search->time;
+                itemstats[id].evicted_time = current_time - search->time;//记录我回收到了几秒之前访问的数据了，用来评估回收的程度
                 if (search->exptime != 0)
                     itemstats[id].evicted_nonzero++;
                 if ((search->it_flags & ITEM_FETCHED) == 0) {
@@ -187,15 +193,16 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
             }
         }
 
-        refcount_decr(&search->refcount);
+        refcount_decr(&search->refcount);//手工减少回引用技术，这样不会导致free内存
         /* If hash values were equal, we don't grab a second lock */
         if (hold_lock)
             item_trylock_unlock(hold_lock);
-        break;
+
+        break;//妈蛋，这里会退出的。。。。
     }
 
-    if (!tried_alloc && (tries == 0 || search == NULL))
-        it = slabs_alloc(ntotal, id);
+    if (!tried_alloc && (tries == 0 || search == NULL))//没申请失败，又没找到快要过期的，那就老老实实申请新的吧
+        it = slabs_alloc(ntotal, id);//从slabs里面申请一个item，里面会处理slabs扩容问题，也会从缓存的slots里面使用item
 
     if (it == NULL) {
         itemstats[id].outofmemory++;
@@ -212,7 +219,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     it->refcount = 1;     /* the caller will have a reference */
     mutex_unlock(&cache_lock);
     it->next = it->prev = it->h_next = 0;
-    it->slabs_clsid = id;
+    it->slabs_clsid = id;//设置我属于哪个slab class
 
     DEBUG_REFCNT(it, '*');
     it->it_flags = settings.use_cas ? ITEM_CAS : 0;
@@ -258,6 +265,7 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
 }
 
 static void item_link_q(item *it) { /* item is the new head */
+	//将it添加到对应的slab的大小数组链表里面去，heads, tails, sizes等
     item **head, **tail;
     assert(it->slabs_clsid < LARGEST_ID);
     assert((it->it_flags & ITEM_SLABBED) == 0);
@@ -298,6 +306,7 @@ static void item_unlink_q(item *it) {
     return;
 }
 
+//将一个it加入hash表，以及放入slab槽里面
 int do_item_link(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
@@ -313,8 +322,8 @@ int do_item_link(item *it, const uint32_t hv) {
 
     /* Allocate a new CAS ID on link. */
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
-    assoc_insert(it, hv);
-    item_link_q(it);
+    assoc_insert(it, hv);//将item加入到hash 槽里面
+    item_link_q(it);//将it添加到对应的slab的大小数组链表里面去，heads, tails, sizes等
     refcount_incr(&it->refcount);
     mutex_unlock(&cache_lock);
 
@@ -326,10 +335,12 @@ void do_item_unlink(item *it, const uint32_t hv) {
     mutex_lock(&cache_lock);
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
+
         STATS_LOCK();
         stats.curr_bytes -= ITEM_ntotal(it);
         stats.curr_items -= 1;
         STATS_UNLOCK();
+
         assoc_delete(ITEM_key(it), it->nkey, hv);
         item_unlink_q(it);
         do_item_remove(it);
@@ -635,6 +646,7 @@ void do_item_flush_expired(void) {
 }
 
 static void crawler_link_q(item *it) { /* item is the new tail */
+	//把it放到末尾
     item **head, **tail;
     assert(it->slabs_clsid < LARGEST_ID);
     assert(it->it_flags == 1);

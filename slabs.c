@@ -25,18 +25,18 @@
 
 typedef struct {
     unsigned int size;      /* sizes of items */
-    unsigned int perslab;   /* how many items per slab */
+    unsigned int perslab;   /* how many items per slab *///每个slab的item数目，是根据settings.item_size_max / slabclass[i].size 计算好了的
 
-    void *slots;           /* list of item ptrs */
+    void *slots;           /* list of item ptrs *///空item 链表，用来复用的，释放后的item都放到这里面，申请新的时，先从这里获取
     unsigned int sl_curr;   /* total free items in list */
 
-    unsigned int slabs;     /* how many slabs were allocated for this class */
+    unsigned int slabs;     /* how many slabs were allocated for this class *///总共有这么多个slab
 
     void **slab_list;       /* array of slab pointers */
     unsigned int list_size; /* size of prev array */
 
     unsigned int killing;  /* index+1 of dying slab, or zero if none */
-    size_t requested; /* The number of requested bytes */
+    size_t requested; /* The number of requested bytes *///这个slab用了多少实际内存了，不是对其的内存加和
 } slabclass_t;
 
 static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
@@ -172,6 +172,7 @@ static void slabs_preallocate (const unsigned int maxslabs) {
 }
 
 static int grow_slab_list (const unsigned int id) {
+	//自动增长一下slabs数组的大小，用来指向我这槽位包含哪些slabs的
     slabclass_t *p = &slabclass[id];
     if (p->slabs == p->list_size) {
         size_t new_size =  (p->list_size != 0) ? p->list_size * 2 : 16;
@@ -184,21 +185,29 @@ static int grow_slab_list (const unsigned int id) {
 }
 
 static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
+	//拆分一块slab页，按照p->size * p->perslab 的大小来, 有没有可能大小不是这样的？
     slabclass_t *p = &slabclass[id];
     int x;
     for (x = 0; x < p->perslab; x++) {
         do_slabs_free(ptr, 0, id);
-        ptr += p->size;
+        ptr += p->size;//指针后移
     }
 }
 
 static int do_slabs_newslab(const unsigned int id) {
+	//申请一个新的slab块，放入p->slab_list，并且拆分好准备用
     slabclass_t *p = &slabclass[id];
-    int len = settings.slab_reassign ? settings.item_size_max
-        : p->size * p->perslab;
+    int len = settings.slab_reassign ? settings.item_size_max : p->size * p->perslab;
+	//参考slabs_init，其实size *perslab 略小于item_size_max, perslab 是根据后者计算出来的
+	//所以split_slab_page_into_freelist 不用传入大小，里面直接按照p->size * p->perslab 来拆分就可以了，不会出现越界的
     char *ptr;
 
-    if ((mem_limit && mem_malloced + len > mem_limit && p->slabs > 0) ||
+	//1.超过内存限制，并且这个slabs上已经申请过了
+	//2.增长slab_list失败
+	//3. 申请新的slab失败
+	//这个slabs>0保证了，每个slab槽至少都可以有一个槽位，从而至少都能分配成功一个item，
+	//那么上层无论如何都有可能evict_to_free策略干掉一个最老的。除非异常情况比如都是空
+	if ((mem_limit && mem_malloced + len > mem_limit && p->slabs > 0) ||
         (grow_slab_list(id) == 0) ||
         ((ptr = memory_allocate((size_t)len)) == 0)) {
 
@@ -206,10 +215,10 @@ static int do_slabs_newslab(const unsigned int id) {
         return 0;
     }
 
-    memset(ptr, 0, (size_t)len);
-    split_slab_page_into_freelist(ptr, id);
+    memset(ptr, 0, (size_t)len);//申请的slabs会全部清空内容
+    split_slab_page_into_freelist(ptr, id);//拆分一块slab页,放到slots 链表里面，增加sl_curr
 
-    p->slab_list[p->slabs++] = ptr;
+    p->slab_list[p->slabs++] = ptr;//我又多了个slab, 其实此时item列表都已经在拆分的时候放到p->slots里面了
     mem_malloced += len;
     MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
 
@@ -218,6 +227,7 @@ static int do_slabs_newslab(const unsigned int id) {
 
 /*@null@*/
 static void *do_slabs_alloc(const size_t size, unsigned int id) {
+	//从缓存的空闲slots链表或者重新申请块新的slab，然后取出一个item用
     slabclass_t *p;
     void *ret = NULL;
     item *it = NULL;
@@ -232,12 +242,13 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
 
     /* fail unless we have space at the end of a recently allocated page,
        we have something on our freelist, or we could allocate a new page */
+	//其实就是，如果sl_curr 不为0，那就去用slots， 否则申请新slab块的放到slots上面,增加sl_curr，然后在执行下面的else
     if (! (p->sl_curr != 0 || do_slabs_newslab(id) != 0)) {
         /* We don't have more memory available */
         ret = NULL;
     } else if (p->sl_curr != 0) {
         /* return off our freelist */
-        it = (item *)p->slots;
+        it = (item *)p->slots;//空闲item都在slots里面，取出一个用就行
         p->slots = it->next;
         if (it->next) it->next->prev = 0;
         p->sl_curr--;
@@ -245,7 +256,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
     }
 
     if (ret) {
-        p->requested += size;
+        p->requested += size;//size是需要的内存大小，不是对齐的
         MEMCACHED_SLABS_ALLOCATE(size, id, p->size, ret);
     } else {
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, id);
@@ -255,6 +266,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
 }
 
 static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
+	//把一块内存放入到slots链表头部，以备后续使用
     slabclass_t *p;
     item *it;
 
@@ -273,7 +285,7 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     if (it->next) it->next->prev = it;
     p->slots = it;
 
-    p->sl_curr++;
+    p->sl_curr++;//总空闲item数目
     p->requested -= size;
     return;
 }
@@ -398,6 +410,7 @@ static void *memory_allocate(size_t size) {
 }
 
 void *slabs_alloc(size_t size, unsigned int id) {
+	//实际上是要申请一个item，看名字以为是slabs
     void *ret;
 
     pthread_mutex_lock(&slabs_lock);
@@ -419,7 +432,7 @@ void slabs_stats(ADD_STAT add_stats, void *c) {
 }
 
 void slabs_adjust_mem_requested(unsigned int id, size_t old, size_t ntotal)
-{
+{//更新一下这个slab用了多少内存了，统计数据
     pthread_mutex_lock(&slabs_lock);
     slabclass_t *p;
     if (id < POWER_SMALLEST || id > power_largest) {

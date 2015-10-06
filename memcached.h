@@ -299,7 +299,7 @@ struct settings {
     char *inter;
     int verbose;
     rel_time_t oldest_live; /* ignore existing items older than this *///时间戳在这个之前的key，全部删除
-    int evict_to_free;
+    int evict_to_free;//开关，默认打开为1， 表示如果内存满了，要不要干掉一个最旧的item使用, 只能干掉本slabs_clsid里面的
     char *socketpath;   /* path to unix socket if using local socket */
     int access;  /* access mask (a la chmod) for unix domain socket */
     double factor;          /* chunk size growth factor */
@@ -317,7 +317,7 @@ struct settings {
     bool sasl;              /* SASL on/off */
     bool maxconns_fast;     /* Whether or not to early close connections */
     bool lru_crawler;        /* Whether or not to enable the autocrawler thread */
-    bool slab_reassign;     /* Whether or not slab reassignment is allowed */
+    bool slab_reassign;     /* Whether or not slab reassignment is allowed *///如果开启，那么每个slab只能item_size_max 这么大
     int slab_automove;     /* Whether or not to automatically move slabs */
     int hashpower_init;     /* Starting hash power level */
     bool shutdown_command; /* allow shutdown command */
@@ -428,6 +428,7 @@ struct conn {
     void   *write_and_free; /** free this memory after finishing writing */
 
     char   *ritem;  /** when we read in an item's value, it goes here */
+	//读取数据的存放目标，一般只想item里面.比如set指令，处理第一行时，只是记录一下待会的数据要存到这里，一会慢慢读取数据部分
     int    rlbytes;
 
     /* data for the nread state */
@@ -486,7 +487,7 @@ struct conn {
     /* This is where the binary header goes */
     protocol_binary_request_header binary_header;//二进制协议头的数据，解析出来的
     uint64_t cas; /* the cas to return */
-    short cmd; /* current command being processed */
+    short cmd; /* current command being processed *///当前正在处理什么样的命令，读取value后，需要判断这个, NREAD_SET 等
     int opaque;
     int keylen;
     conn   *next;     /* Used for generating a list of conn structures */

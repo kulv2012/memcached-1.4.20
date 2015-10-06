@@ -61,7 +61,9 @@ static unsigned int item_lock_hashpower;
 #define hashmask(n) (hashsize(n)-1)
 /* this lock is temporarily engaged during a hash table expansion */
 static pthread_mutex_t item_global_lock;
+
 /* thread-specific variable for deeply finding the item lock type */
+//assoc_maintenance_thread 维护线程在如果没有进行expanding的时候，会进行锁类型切换, 从而给每个工作线程的管道发'g'指令，进而调用到thread_libevent_process 
 static pthread_key_t item_lock_type_key;
 
 static LIBEVENT_DISPATCHER_THREAD dispatcher_thread;//这是主线程的结构
@@ -160,7 +162,7 @@ void item_unlock(uint32_t hv) {
 
 static void wait_for_thread_registration(int nthreads) {
     while (init_count < nthreads) {
-		//下面会自动解锁，然后睡眠；直到等到条件变量激活后，才自动再加锁
+		//下面会自动解锁init_lock，然后睡眠；直到等到条件变量激活后，才自动再加锁init_lock
         pthread_cond_wait(&init_cond, &init_lock);//外层已经加锁了的。所以这里不需要加锁。
 		//目前为加锁状态
     }

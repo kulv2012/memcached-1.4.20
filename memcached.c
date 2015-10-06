@@ -104,7 +104,7 @@ static void conn_free(conn *c);
 struct stats stats;
 struct settings settings;
 time_t process_started;     /* when the process was started */
-conn **conns;
+conn **conns;//所有连接的结构，数组，用fd索引
 
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
@@ -491,6 +491,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 }
 
 static void conn_release_items(conn *c) {//将一个连接所涉及到的item给解除引用，因为数据已经发送完成了
+	//这里是得等所有数据发送完了，才能释放item列表，只要有没有完成的，就不能释放
     assert(c != NULL);
 
     if (c->item) {
@@ -896,9 +897,10 @@ static void out_of_memory(conn *c, char *ascii_error) {
  * has been stored in c->cmd, and the item is ready in c->item.
  */
 static void complete_nread_ascii(conn *c) {
+	//complete_nread调用这里，处理文本协议
     assert(c != NULL);
 
-    item *it = c->item;
+    item *it = c->item;//取回在process_update_command 设置的item，key已经存在里面 了
     int comm = c->cmd;
     enum store_item_type ret;
 
@@ -906,7 +908,7 @@ static void complete_nread_ascii(conn *c) {
     c->thread->stats.slab_stats[it->slabs_clsid].set_cmds++;
     pthread_mutex_unlock(&c->thread->stats.mutex);
 
-    if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) != 0) {
+    if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) != 0) {//必须是\r\n结束,并且包含在数据里面
         out_string(c, "CLIENT_ERROR bad data chunk");
     } else {
       ret = store_item(it, comm, c);
@@ -960,6 +962,7 @@ static void complete_nread_ascii(conn *c) {
 
     }
 
+	//当初process_update_command 申请item_alloc的时候，默认加了引用计数1的，这里减除
     item_remove(c->item);       /* release the c->item reference */
     c->item = 0;
 }
@@ -2284,6 +2287,7 @@ static void reset_cmd_handler(conn *c) {
 }
 
 static void complete_nread(conn *c) {
+	//process_update_command 等函数设置连接状态为conn_nread之后，如果读取数据完成，会由drive_mechine调用这里，完成后续的步骤
     assert(c != NULL);
     assert(c->protocol == ascii_prot
            || c->protocol == binary_prot);
@@ -2303,7 +2307,7 @@ static void complete_nread(conn *c) {
  */
 enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
     char *key = ITEM_key(it);
-    item *old_it = do_item_get(key, it->nkey, hv);
+    item *old_it = do_item_get(key, it->nkey, hv);//看看是不是已经存在了 
     enum store_item_type stored = NOT_STORED;
 
     item *new_it = NULL;
@@ -2311,7 +2315,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
 
     if (old_it != NULL && comm == NREAD_ADD) {
         /* add only adds a nonexistent item, but promote to head of LRU */
-        do_item_update(old_it);
+        do_item_update(old_it);//add指令已经存在，不覆盖，只更新时间
     } else if (!old_it && (comm == NREAD_REPLACE
         || comm == NREAD_APPEND || comm == NREAD_PREPEND))
     {
@@ -2325,7 +2329,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             c->thread->stats.cas_misses++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
         }
-        else if (ITEM_get_cas(it) == ITEM_get_cas(old_it)) {
+        else if (ITEM_get_cas(it) == ITEM_get_cas(old_it)) {//CAS 标志是相等的，ok， 能更新，直接替换之
             // cas validates
             // it and old_it may belong to different classes.
             // I'm updating the stats for the one that's getting pushed out
@@ -2333,9 +2337,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             c->thread->stats.slab_stats[old_it->slabs_clsid].cas_hits++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
-            item_replace(old_it, it, hv);
+            item_replace(old_it, it, hv);//删掉以前的，link新的
             stored = STORED;
-        } else {
+        } else {//标志不一致，不能替换
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.slab_stats[old_it->slabs_clsid].cas_badval++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -2390,17 +2394,17 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                     memcpy(ITEM_data(new_it) + it->nbytes - 2 /* CRLF */, ITEM_data(old_it), old_it->nbytes);
                 }
 
-                it = new_it;
+                it = new_it;//使用心得it，注意上面其实只是分配了一个新it，还没有设置到存储系统里面，下面的replace或者link是干这个的
             }
         }
 
-        if (stored == NOT_STORED) {
+        if (stored == NOT_STORED) {//出了CAS 成功，其他都到这里，进行真正的add， 或者更新
             if (old_it != NULL)
                 item_replace(old_it, it, hv);
             else
                 do_item_link(it, hv);
 
-            c->cas = ITEM_get_cas(it);
+            c->cas = ITEM_get_cas(it);//这个地方是多余的吧，因为函数底部会设置CAS的
 
             stored = STORED;
         }
@@ -2409,7 +2413,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
     if (old_it != NULL)
         do_item_remove(old_it);         /* release our reference */
     if (new_it != NULL)
-        do_item_remove(new_it);
+        do_item_remove(new_it);//do_item_link或item_replace 会增加引用技术的，这里减除第一次的就行了
 
     if (stored == STORED) {
         c->cas = ITEM_get_cas(it);
@@ -2504,7 +2508,7 @@ static void write_and_free(conn *c, char *buf, int bytes) {
 }
 
 static inline bool set_noreply_maybe(conn *c, token_t *tokens, size_t ntokens)
-{
+{//command key [flags] [exptime] length [noreply] , ntokens 最后一个是空的，所以-2
     int noreply_index = ntokens - 2;
 
     /*
@@ -2881,7 +2885,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
             key = key_token->value;
             nkey = key_token->length;
 
-            if(nkey > KEY_MAX_LENGTH) {//key最长250个字符
+            if(nkey > KEY_MAX_LENGTH) {//key最长250个字符, 后面有有问题的，就把前面已经拿到的list给减少引用技术，返回
                 out_string(c, "CLIENT_ERROR bad command line format");
                 while (i-- > 0) {
                     item_remove(*(c->ilist + i));
@@ -2894,12 +2898,12 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 stats_prefix_record_get(key, nkey, NULL != it);
             }
             if (it) {
-                if (i >= c->isize) {
+                if (i >= c->isize) {//这里是处理临时的item指针列表数组扩容
                     item **new_list = realloc(c->ilist, sizeof(item *) * c->isize * 2);
                     if (new_list) {
                         c->isize *= 2;
                         c->ilist = new_list;//记住这个item，保留其引用技计数。
-                    } else {
+                    } else {//这一个没搞定，申请失败，去掉这一个，继续
                         STATS_LOCK();
                         stats.malloc_fails++;
                         STATS_UNLOCK();
@@ -2911,9 +2915,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 /*
                  * Construct the response. Each hit adds three elements to the
                  * outgoing data list:
-                 *   "VALUE "
-                 *   key
-                 *   " " + flags + " " + data length + "\r\n" + data (with \r\n)
+                 *   "VALUE "+ key + " " + flags + " " + data length + "\r\n" + data (with \r\n)
 				 *   get aaaa
 				 *   返回格式是这样的：
 				 *   "VALUE aaaa 0 5
@@ -3003,6 +3005,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 pthread_mutex_unlock(&c->thread->stats.mutex);
                 item_update(it);//更新访问时间等
                 *(c->ilist + i) = it;//it的数据被指向了，不要轻易删除， 在上面已经增加了引用计数丶，因此将其指针挂载到ilist。发送完数据后就减少引用
+				//注意这个ilist指针引用技术释放的时机是得等所有数据发送完了，才能开始释放这个列表。释放操作在conn_release_items
                 i++;//item_get 自动增加引用计数了的
 
             } else {//没找到，只能放弃了
@@ -3054,6 +3057,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
 	//解析 "set aaa 0 0 5" 指令，申请内存用来后续存放数据部分的内容， 注意这里只是申请没存，没做其他操作
+	//处理完后悔设置连接的状态为conn_nread， 因此继续读取数据到指定地方, 这样节省了内存的拷贝
     char *key;
     size_t nkey;
     unsigned int flags;
@@ -3099,7 +3103,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         }
     }
 
-    vlen += 2;
+    vlen += 2;//这是啥? 数据必须是\r\n结束,并且包含在数据里面
     if (vlen < 0 || vlen - 2 < 0) {
         out_string(c, "CLIENT_ERROR bad command line format");
         return;
@@ -3134,14 +3138,16 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     }
     ITEM_set_cas(it, req_cas_id);
 
-    c->item = it;
-    c->ritem = ITEM_data(it);
+    c->item = it;//记录一下item是哪个, item_alloc 默认加引用计数了，处理完后，记得减除
+    c->ritem = ITEM_data(it);//数据存放目标是这里
     c->rlbytes = it->nbytes;//在这里标记一下，我还需要读取多少数据。读取完成后，会调用complete_nread发送SOTRED给客户端
-    c->cmd = comm;
+    c->cmd = comm;//命令类型, 商城设置为NREAD_SET等
+	//读取完成后，会在drive_mechine里面调用complete_nread 函数去处理后续的事情
     conn_set_state(c, conn_nread);
 }
 
 static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {
+	//更新其访问时间，重新计算过期时间，移动到链表头部等
     char *key;
     size_t nkey;
     int32_t exptime_int = 0;
@@ -3166,14 +3172,14 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
 
     it = item_touch(key, nkey, realtime(exptime_int));
     if (it) {
-        item_update(it);
+        item_update(it);////更新其访问时间，移动到链表头部等
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.touch_cmds++;
         c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         out_string(c, "TOUCHED");
-        item_remove(it);
+        item_remove(it);//减少引用计数
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.touch_cmds++;
@@ -3448,7 +3454,7 @@ static void process_command(conn *c, char *command) {
         return;
     }
 
-	//将客户端的指令用空格分开，根据参数个数等进行处理
+	//将客户端的指令用空格分开，根据参数个数等进行处理, 最后有一个空的
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
     if (ntokens >= 3 &&
         ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
@@ -3797,7 +3803,7 @@ static int try_read_command(conn *c) {
         assert(c->rcurr <= (c->rbuf + c->rsize));
     }
 
-    return 1;
+    return 1;//这里返回1后，上层还会继续进来调用这里解析命令的
 }
 
 /*
@@ -4174,7 +4180,9 @@ static void drive_machine(conn *c) {
             }
             break;
 
-        case conn_nread://需要读取c->rlbytes个字节的数据
+        case conn_nread:
+			//process_update_command 等之后，将状态设置为conn_nread，设置指针ritem, rlbytes， 以备读取这么多数据，从而调用complete_nread
+			//需要读取c->rlbytes个字节的数据, 放到rlist里面, 这里应该是读取某个value, 之前的用conn_read里面的try_read_network读取
             if (c->rlbytes == 0) {
                 complete_nread(c);//读取完毕了。
                 break;
@@ -4205,7 +4213,7 @@ static void drive_machine(conn *c) {
             }
 
             /*  now try reading from the socket */
-            res = read(c->sfd, c->ritem, c->rlbytes);
+            res = read(c->sfd, c->ritem, c->rlbytes);//就读取这么多，放在目标内存里面
             if (res > 0) {
                 pthread_mutex_lock(&c->thread->stats.mutex);
                 c->thread->stats.bytes_read += res;

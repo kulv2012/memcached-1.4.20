@@ -158,7 +158,7 @@ int assoc_insert(item *it, const uint32_t hv) {
 
     if (expanding &&
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
-    {
+    {// 如果正在扩容，并且此时当前这个槽位在正在迁移的槽位后面，那么这个节点应该加到老地方去，因为待会就回扫到他了。
         it->h_next = old_hashtable[oldbucket];
         old_hashtable[oldbucket] = it;
     } else {
@@ -168,7 +168,7 @@ int assoc_insert(item *it, const uint32_t hv) {
 
     hash_items++;
     if (! expanding && hash_items > (hashsize(hashpower) * 3) / 2) {
-        assoc_start_expand();
+        assoc_start_expand();//槽位容量整体大于1.5个时，扩容。那么，缩小呢？
     }
 
     MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey, hash_items);
@@ -248,7 +248,7 @@ static void *assoc_maintenance_thread(void *arg) {
             /* We are done expanding.. just wait for next invocation */
             mutex_lock(&cache_lock);
             started_expanding = false;
-            pthread_cond_wait(&maintenance_cond, &cache_lock);
+            pthread_cond_wait(&maintenance_cond, &cache_lock);//assoc_insert 等地方发现容量大于1.5时会唤醒信号量
             /* Before doing anything, tell threads to use a global lock */
             mutex_unlock(&cache_lock);
             slabs_rebalancer_pause();
